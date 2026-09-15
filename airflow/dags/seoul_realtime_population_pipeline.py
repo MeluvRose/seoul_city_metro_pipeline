@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 import xmltodict
@@ -302,7 +303,7 @@ def seoul_realtime_population_pipeline():
         return saved_raw_id
 
     @task
-    def load_population_to_staging(raw_id: int) -> None:
+    def load_population_to_staging(raw_id: int) -> int:
         hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
 
         row = hook.get_first(
@@ -354,7 +355,7 @@ def seoul_realtime_population_pipeline():
             population["PPLTN_TIME"],
             "%Y-%m-%d %H:%M",
         ).replace(
-            tzinfo=timezone.utc,
+            tzinfo=ZoneInfo("Asia/Seoul"),
         )
 
         population_min = int(population["AREA_PPLTN_MIN"])
@@ -493,6 +494,8 @@ def seoul_realtime_population_pipeline():
             f"observed_at={observed_at}, "
             f"population={population_min}~{population_max}"
         )
+
+        return saved_raw_id
 
     raw_id = extract_real_api_to_raw()
     validated_raw_id = validate_raw_payload(raw_id)
