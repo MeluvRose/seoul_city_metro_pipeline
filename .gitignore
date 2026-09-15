@@ -1,0 +1,48 @@
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+airflow/.env
+
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Airflow runtime logs
+airflow/logs/
+*.log
+airflow-*.log
+airflow-*.out
+airflow-*.err
+airflow-*.pid
+
+# Airflow local runtime files
+airflow/airflow.cfg
+airflow/airflow.db
+airflow/standalone_admin_password.txt
+.airflow_db_initialised
+
+# Test and coverage artifacts
+.pytest_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Jupyter temporary files
+.ipynb_checkpoints/
+
+# IDE settings
+.vscode/
+.idea/
+
+# OS-generated files
+.DS_Store
+Thumbs.db
