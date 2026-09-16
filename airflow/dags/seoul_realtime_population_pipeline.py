@@ -7,9 +7,10 @@ from zoneinfo import ZoneInfo
 
 import requests
 import xmltodict
+import logging
 
 from airflow.decorators import dag, task
-from airflow.exceptions import AirflowFailException
+from airflow.exceptions import AirflowFailException, AirflowException
 from airflow.sdk import Variable
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
@@ -496,9 +497,291 @@ def seoul_realtime_population_pipeline():
         )
 
         return saved_raw_id
+    
+    @task
+    def load_dimensions(ingestion_id: int) -> int:
+        """
+        현재 ingestion_id에 포함된 장소를 dim_location에 적재한다.
+
+        dim_date와 dim_hour는 정적 차원이므로,
+        최초 SQL 실행으로 생성된 상태를 전제한다.
+        """
+        sql = """
+        INSERT INTO warehouse.dim_location (
+            area_code,
+            area_name,
+            timezone_name,
+            is_active,
+            updated_at
+        )
+        SELECT DISTINCT
+            area_code,
+            area_name,
+            'Asia/Seoul',
+            true,
+            CURRENT_TIMESTAMP
+        FROM staging.v_realtime_population_for_dw
+        WHERE ingestion_id = %(ingestion_id)s
+
+        ON CONFLICT (area_code)
+        DO UPDATE SET
+            area_name = EXCLUDED.area_name,
+            timezone_name = EXCLUDED.timezone_name,
+            is_active = EXCLUDED.is_active,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE warehouse.dim_location.area_name
+                IS DISTINCT FROM EXCLUDED.area_name
+        OR warehouse.dim_location.timezone_name
+                IS DISTINCT FROM EXCLUDED.timezone_name
+        OR warehouse.dim_location.is_active
+                IS DISTINCT FROM EXCLUDED.is_active;
+        """
+
+        hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+
+        with hook.get_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, {"ingestion_id": ingestion_id})
+
+        return ingestion_id
+
+    @task
+    def load_fact_city_snapshot(ingestion_id: int) -> int:
+        """
+        Staging의 현재 ingestion_id 데이터를
+        Warehouse의 원자 Fact로 적재한다.
+
+        Fact grain:
+        한 생활권(location)의 한 observed_at 시점에 대한
+        인구·혼잡 Snapshot 1건
+        """
+        sql = """
+        WITH src AS (
+            SELECT
+                s.*,
+                s.observed_at AT TIME ZONE 'Asia/Seoul' AS observed_at_kst
+            FROM staging.v_realtime_population_for_dw AS s
+            WHERE s.ingestion_id = %(ingestion_id)s
+        )
+        INSERT INTO warehouse.fact_city_snapshot (
+            location_id,
+            date_key,
+            hour_key,
+            observed_at,
+            collected_at,
+            congestion_level,
+            congestion_message,
+            population_min,
+            population_max,
+            male_ratio,
+            female_ratio,
+            resident_ratio,
+            non_resident_ratio,
+            source_ingestion_id
+        )
+        SELECT
+            l.location_id,
+            TO_CHAR(src.observed_at_kst::date, 'YYYYMMDD')::integer,
+            EXTRACT(HOUR FROM src.observed_at_kst)::smallint,
+            src.observed_at,
+            src.collected_at,
+            src.congestion_level,
+            src.congestion_message,
+            src.population_min,
+            src.population_max,
+            src.male_ratio,
+            src.female_ratio,
+            src.resident_ratio,
+            src.non_resident_ratio,
+            src.ingestion_id
+        FROM src
+        JOIN warehouse.dim_location AS l
+        ON l.area_code = src.area_code
+
+        ON CONFLICT ON CONSTRAINT uq_fact_city_location_observed
+        DO UPDATE SET
+            date_key = EXCLUDED.date_key,
+            hour_key = EXCLUDED.hour_key,
+            collected_at = EXCLUDED.collected_at,
+            congestion_level = EXCLUDED.congestion_level,
+            congestion_message = EXCLUDED.congestion_message,
+            population_min = EXCLUDED.population_min,
+            population_max = EXCLUDED.population_max,
+            male_ratio = EXCLUDED.male_ratio,
+            female_ratio = EXCLUDED.female_ratio,
+            resident_ratio = EXCLUDED.resident_ratio,
+            non_resident_ratio = EXCLUDED.non_resident_ratio,
+            source_ingestion_id = EXCLUDED.source_ingestion_id,
+            dw_updated_at = CURRENT_TIMESTAMP
+        WHERE EXCLUDED.collected_at >= warehouse.fact_city_snapshot.collected_at;
+        """
+
+        hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+
+        with hook.get_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, {"ingestion_id": ingestion_id})
+
+        return ingestion_id
+
+    @task
+    def validate_dw_load(ingestion_id: int) -> None:
+        """
+        현재 DAG 실행의 ingestion_id가 Warehouse에
+        정상 적재되었는지 검증한다.
+
+        검증 실패 시 AirflowException을 발생시켜
+        DAG 실행을 실패 처리한다.
+        """
+        sql = """
+        WITH current_fact AS (
+            SELECT
+                f.city_snapshot_id,
+                f.location_id,
+                f.date_key,
+                f.hour_key,
+                f.observed_at,
+                f.collected_at,
+                f.population_min,
+                f.population_max,
+                f.source_ingestion_id
+            FROM warehouse.fact_city_snapshot AS f
+            WHERE f.source_ingestion_id = %(ingestion_id)s
+        )
+
+        SELECT
+            COUNT(*) AS fact_count,
+
+            COUNT(*) FILTER (
+                WHERE l.location_id IS NULL
+            ) AS missing_location_count,
+
+            COUNT(*) FILTER (
+                WHERE d.date_key IS NULL
+            ) AS missing_date_count,
+
+            COUNT(*) FILTER (
+                WHERE h.hour_key IS NULL
+            ) AS missing_hour_count,
+
+            COUNT(*) FILTER (
+                WHERE f.population_min IS NOT NULL
+                AND f.population_max IS NOT NULL
+                AND f.population_min > f.population_max
+            ) AS invalid_population_range_count,
+
+            COUNT(*) FILTER (
+                WHERE f.observed_at > f.collected_at
+            ) AS future_observation_count,
+
+            COUNT(*) FILTER (
+                WHERE f.date_key <> TO_CHAR(
+                    (f.observed_at AT TIME ZONE 'Asia/Seoul')::DATE,
+                    'YYYYMMDD'
+                )::INTEGER
+                OR f.hour_key <> EXTRACT(
+                    HOUR FROM f.observed_at AT TIME ZONE 'Asia/Seoul'
+                )::SMALLINT
+            ) AS time_key_mismatch_count,
+
+            COUNT(*) FILTER (
+                WHERE p.population_snapshot_id IS NULL
+            ) AS missing_staging_population_count,
+
+            COUNT(*) FILTER (
+                WHERE p.population_snapshot_id IS NOT NULL
+                AND (
+                        f.population_min IS DISTINCT FROM p.population_min
+                    OR f.population_max IS DISTINCT FROM p.population_max
+                )
+            ) AS staging_fact_population_mismatch_count
+
+        FROM current_fact AS f
+
+        LEFT JOIN warehouse.dim_location AS l
+            ON l.location_id = f.location_id
+
+        LEFT JOIN warehouse.dim_date AS d
+            ON d.date_key = f.date_key
+
+        LEFT JOIN warehouse.dim_hour AS h
+            ON h.hour_key = f.hour_key
+
+        LEFT JOIN staging.realtime_population_snapshot AS p
+            ON p.ingestion_id = f.source_ingestion_id
+            AND p.area_code = l.area_code
+            AND p.observed_at = f.observed_at;
+        """
+
+        logger = logging.getLogger(__name__)
+        hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+
+        row = hook.get_first(
+            sql,
+            parameters={"ingestion_id": ingestion_id},
+        )
+
+        (
+            fact_count,
+            missing_location_count,
+            missing_date_count,
+            missing_hour_count,
+            invalid_population_range_count,
+            future_observation_count,
+            time_key_mismatch_count,
+            missing_staging_population_count,
+            staging_fact_population_mismatch_count,
+        ) = row
+
+        metrics = {
+        "ingestion_id": ingestion_id,
+        "fact_count": fact_count,
+        "missing_location_count": missing_location_count,
+        "missing_date_count": missing_date_count,
+        "missing_hour_count": missing_hour_count,
+        "invalid_population_range_count": invalid_population_range_count,
+        "future_observation_count": future_observation_count,
+        "time_key_mismatch_count": time_key_mismatch_count,
+        "missing_staging_population_count": missing_staging_population_count,
+        "staging_fact_population_mismatch_count": staging_fact_population_mismatch_count,
+        }
+
+        if fact_count != 1:
+            raise AirflowException(
+                f"DW Fact 건수 오류: ingestion_id={ingestion_id}, "
+                f"expected=1, actual={fact_count}"
+            )
+
+        failed_checks = {
+            "missing_location_count": missing_location_count,
+            "missing_date_count": missing_date_count,
+            "missing_hour_count": missing_hour_count,
+            "invalid_population_range_count": invalid_population_range_count,
+            "future_observation_count": future_observation_count,
+            "time_key_mismatch_count": time_key_mismatch_count,
+            "staging_fact_population_mismatch_count":
+                staging_fact_population_mismatch_count,
+        }
+
+        violations = {
+            name: count
+            for name, count in failed_checks.items()
+            if count != 0
+        }
+
+        if violations:
+            raise AirflowException(
+                f"DW 데이터 품질 검증 실패: "
+                f"ingestion_id={ingestion_id}, violations={violations}"
+            )
+
+        logger.info("DW 데이터 품질 검증 성공. metrics=%s", metrics)
 
     raw_id = extract_real_api_to_raw()
     validated_raw_id = validate_raw_payload(raw_id)
-    load_population_to_staging(validated_raw_id)
+    ingestion_id = load_population_to_staging(validated_raw_id)
+    dimension_ingestion_id = load_dimensions(ingestion_id)
+    fact_ingestion_id = load_fact_city_snapshot(dimension_ingestion_id)
+    validate_dw_load(fact_ingestion_id)
 
 seoul_realtime_population_pipeline()
