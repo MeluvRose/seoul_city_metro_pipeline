@@ -4,12 +4,13 @@ import json
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
+from decimal import Decimal, InvalidOperation
 
 import requests
 import xmltodict
 import logging
 
-from airflow.decorators import dag, task
+from airflow.decorators import dag, task, task_group
 from airflow.exceptions import AirflowFailException, AirflowException
 from airflow.sdk import Variable
 from airflow.providers.postgres.hooks.postgres import PostgresHook
@@ -17,7 +18,26 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 POSTGRES_CONN_ID = "seoul_city_postgres"
 SOURCE_NAME = "seoul_realtime_city"
-TARGET_AREA_NAME = "용산역"
+TARGET_AREA_NAMES = ["용산역", "여의도", "광화문·덕수궁"]
+KST = ZoneInfo("Asia/Seoul")
+
+def to_decimal_or_none(value: object) -> Decimal | None:
+    """
+    서울시 API의 숫자형 문자열을 Decimal로 변환하고, 
+    None, 빈 문자열, '-', '없음' 등 수치가 아닌 표기는 None으로 처리한다.
+    """
+    if value is None:
+        return None
+    
+    text = str(value).strip()
+    
+    if text in ('', "-", "없음", "null", "None"):
+        return None
+    
+    try:
+        return Decimal(text)
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(f"숫자 변환 불가: value={value!r}") from exc
 
 
 @dag(
@@ -30,12 +50,12 @@ TARGET_AREA_NAME = "용산역"
 )
 def seoul_realtime_population_pipeline():
     @task
-    def extract_real_api_to_raw() -> int:
+    def extract_real_api_to_raw(target_area: str) -> int:
         api_key = Variable.get("SEOUL_OPEN_API_KEY")
 
         url = (
             "http://openapi.seoul.go.kr:8088/"
-            f"{api_key}/xml/citydata/1/5/{TARGET_AREA_NAME}"
+            f"{api_key}/xml/citydata/1/5/{target_area}"
         )
 
         try:
@@ -47,12 +67,12 @@ def seoul_realtime_population_pipeline():
 
         except requests.RequestException as exc:
             raise AirflowFailException(
-                f"서울시 API 호출 실패: area={TARGET_AREA_NAME}, error={exc}"
+                f"서울시 API 호출 실패: area={target_area}, error={exc}"
             ) from exc
 
         except Exception as exc:
             raise AirflowFailException(
-                f"서울시 API XML→JSON 변환 실패: area={TARGET_AREA_NAME}, error={exc}"
+                f"서울시 API XML→JSON 변환 실패: area={target_area}, error={exc}"
             ) from exc
         
         # 성공 응답: <SeoulRtd.citydata><CITYDATA>...</CITYDATA>
@@ -66,7 +86,7 @@ def seoul_realtime_population_pipeline():
             result_message = error_response.get("MESSAGE")
 
             area_code = None
-            area_name = TARGET_AREA_NAME
+            area_name = target_area
 
             is_success = False
         else:
@@ -77,7 +97,7 @@ def seoul_realtime_population_pipeline():
             city_data = city_response.get("CITYDATA", {})
 
             area_code = city_data.get("AREA_CD")
-            area_name = city_data.get("AREA_NM") or TARGET_AREA_NAME
+            area_name = city_data.get("AREA_NM") or target_area
 
             is_success = (
                 http_status == 200
@@ -499,6 +519,222 @@ def seoul_realtime_population_pipeline():
         return saved_raw_id
     
     @task
+    def load_weather_to_staging(ingestion_id: int) -> int:
+        """
+        현재 ingestion_id에 연결된 Raw JSONB에서 WEATHER_STTS를 추출해
+        staging.realtime_weather_snapshot에 UPSERT한다.
+
+        WEATHER_STTS가 없으면 인구 파이프라인을 실패시키지 않고,
+        경고 로그를 남긴 뒤 같은 ingestion_id를 반환한다.
+        """
+
+        logger = logging.getLogger(__name__)
+
+        hook = PostgresHook(
+            postgres_conn_id=POSTGRES_CONN_ID,
+        )
+
+        source_row = hook.get_first(
+            """
+            SELECT
+                h.ingestion_id,
+                h.area_code,
+                h.area_name,
+                h.observed_at AS header_observed_at,
+                r.payload
+            FROM staging.realtime_city_header AS h
+            JOIN raw.api_response AS r
+            ON r.raw_id = h.ingestion_id
+            WHERE h.ingestion_id = %(ingestion_id)s
+            AND h.is_success = true;
+            """,
+            parameters={
+                "ingestion_id": ingestion_id,
+            },
+        )
+
+        if source_row is None:
+            raise AirflowException(
+                "날씨 Staging 적재 실패: "
+                f"성공 Header 또는 Raw payload를 찾을 수 없습니다. "
+                f"ingestion_id={ingestion_id}"
+            )
+
+        (
+            source_ingestion_id,
+            area_code,
+            area_name,
+            header_observed_at,
+            payload,
+        ) = source_row
+
+        # psycopg 환경에 따라 JSONB가 dict 또는 JSON 문자열로 반환될 수 있다.
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+
+        city_response = payload.get("SeoulRtd.citydata", {})
+        city_data = city_response.get("CITYDATA", {})
+        weather_wrapper = city_data.get("WEATHER_STTS", {})
+
+        if not isinstance(weather_wrapper, dict):
+            logger.warning(
+                "WEATHER_STTS wrapper 형식 오류: "
+                "ingestion_id=%s, area_code=%s, actual_type=%s",
+                ingestion_id,
+                area_code,
+                type(weather_wrapper).__name__,
+            )
+            return ingestion_id
+
+        weather = weather_wrapper.get("WEATHER_STTS", {})
+
+        if not isinstance(weather, dict) or not weather:
+            logger.warning(
+                "내부 WEATHER_STTS 누락: Weather Snapshot을 적재하지 않습니다. "
+                "ingestion_id=%s, area_code=%s, area_name=%s",
+                ingestion_id,
+                area_code,
+                area_name,
+            )
+            return ingestion_id
+
+        weather_time_text = weather.get("WEATHER_TIME")
+
+        if not weather_time_text:
+            raise AirflowException(
+                "WEATHER_STTS.WEATHER_TIME 누락: "
+                f"ingestion_id={ingestion_id}, area_code={area_code}"
+            )
+
+        try:
+            weather_observed_at = (
+                datetime.strptime(
+                    str(weather_time_text),
+                    "%Y-%m-%d %H:%M",
+                )
+                .replace(tzinfo=KST)
+                .astimezone(timezone.utc)
+            )
+        except ValueError as exc:
+            raise AirflowException(
+                "WEATHER_TIME 파싱 실패: "
+                f"ingestion_id={ingestion_id}, "
+                f"area_code={area_code}, "
+                f"value={weather_time_text!r}"
+            ) from exc
+
+        try:
+            temperature_c = to_decimal_or_none(weather.get("TEMP"))
+            humidity_pct = to_decimal_or_none(weather.get("HUMIDITY"))
+            precipitation_mm = to_decimal_or_none(
+                weather.get("PRECIPITATION")
+            )
+            wind_speed_mps = to_decimal_or_none(
+                weather.get("WIND_SPD")
+            )
+            pm10 = to_decimal_or_none(weather.get("PM10"))
+            pm25 = to_decimal_or_none(weather.get("PM25"))
+            weather_description = "\n".join([
+                weather.get("AIR_MSG"),
+                weather.get("PCP_MSG"),
+                weather.get("UV_MSG"),
+            ])
+        except ValueError as exc:
+            raise AirflowException(
+                "WEATHER_STTS 수치 필드 변환 실패: "
+                f"ingestion_id={ingestion_id}, "
+                f"area_code={area_code}, error={exc}"
+            ) from exc
+
+        precipitation_type = weather.get("PRECPT_TYPE")
+        air_quality_index = weather.get("AIR_IDX")
+
+        hook.run(
+            """
+            INSERT INTO staging.realtime_weather_snapshot (
+                ingestion_id,
+                area_code,
+                observed_at,
+                temperature_c,
+                feels_like_c,
+                humidity_pct,
+                precipitation_type,
+                precipitation_mm,
+                wind_speed_mps,
+                wind_direction_deg,
+                pm10,
+                pm25,
+                air_quality_index,
+                weather_description
+            )
+            VALUES (
+                %(ingestion_id)s,
+                %(area_code)s,
+                %(observed_at)s,
+                %(temperature_c)s,
+                NULL,
+                %(humidity_pct)s,
+                %(precipitation_type)s,
+                %(precipitation_mm)s,
+                %(wind_speed_mps)s,
+                NULL,
+                %(pm10)s,
+                %(pm25)s,
+                %(air_quality_index)s,
+                %(weather_description)s
+            )
+            ON CONFLICT (ingestion_id)
+            DO UPDATE SET
+                area_code = EXCLUDED.area_code,
+                observed_at = EXCLUDED.observed_at,
+                temperature_c = EXCLUDED.temperature_c,
+                feels_like_c = EXCLUDED.feels_like_c,
+                humidity_pct = EXCLUDED.humidity_pct,
+                precipitation_type = EXCLUDED.precipitation_type,
+                precipitation_mm = EXCLUDED.precipitation_mm,
+                wind_speed_mps = EXCLUDED.wind_speed_mps,
+                wind_direction_deg = EXCLUDED.wind_direction_deg,
+                pm10 = EXCLUDED.pm10,
+                pm25 = EXCLUDED.pm25,
+                air_quality_index = EXCLUDED.air_quality_index,
+                weather_description = EXCLUDED.weather_description,
+                loaded_at = CURRENT_TIMESTAMP;
+            """,
+            parameters={
+                "ingestion_id": source_ingestion_id,
+                "area_code": area_code,
+                "observed_at": weather_observed_at,
+                "temperature_c": temperature_c,
+                "humidity_pct": humidity_pct,
+                "precipitation_type": precipitation_type,
+                "precipitation_mm": precipitation_mm,
+                "wind_speed_mps": wind_speed_mps,
+                "pm10": pm10,
+                "pm25": pm25,
+                "air_quality_index": air_quality_index,
+                "weather_description": weather_description,
+            },
+        )
+
+        logger.info(
+            "Weather Staging UPSERT 성공 | "
+            "ingestion_id=%s, area_code=%s, area_name=%s, "
+            "weather_observed_at=%s, header_observed_at=%s, "
+            "temperature_c=%s, humidity_pct=%s, pm10=%s, pm25=%s",
+            source_ingestion_id,
+            area_code,
+            area_name,
+            weather_observed_at,
+            header_observed_at,
+            temperature_c,
+            humidity_pct,
+            pm10,
+            pm25,
+        )
+
+        return ingestion_id
+
+    @task
     def load_dimensions(ingestion_id: int) -> int:
         """
         현재 ingestion_id에 포함된 장소를 dim_location에 적재한다.
@@ -625,7 +861,7 @@ def seoul_realtime_population_pipeline():
         return ingestion_id
 
     @task
-    def validate_dw_load(ingestion_id: int) -> None:
+    def validate_dw_load(ingestion_id: int) -> int:
         """
         현재 DAG 실행의 ingestion_id가 Warehouse에
         정상 적재되었는지 검증한다.
@@ -776,12 +1012,387 @@ def seoul_realtime_population_pipeline():
             )
 
         logger.info("DW 데이터 품질 검증 성공. metrics=%s", metrics)
+        return ingestion_id
 
-    raw_id = extract_real_api_to_raw()
-    validated_raw_id = validate_raw_payload(raw_id)
-    ingestion_id = load_population_to_staging(validated_raw_id)
-    dimension_ingestion_id = load_dimensions(ingestion_id)
-    fact_ingestion_id = load_fact_city_snapshot(dimension_ingestion_id)
-    validate_dw_load(fact_ingestion_id)
+    @task
+    def load_fact_weather_snapshot(ingestion_id: int) -> int:
+        """
+        Staging Weather Snapshot을 Warehouse Weather Fact에 UPSERT한다.
+
+        Fact grain:
+        한 지역의 한 실제 날씨 관측 시각에 대한 날씨·대기질 Snapshot 1건.
+
+        Business key:
+        (location_id, observed_at)
+        """
+
+        logger = logging.getLogger(__name__)
+
+        hook = PostgresHook(
+            postgres_conn_id=POSTGRES_CONN_ID,
+        )
+
+        # hook.get_first()에 서로 다른 작업의 여러 SQL 문장을 전달하는
+        # 방식은 환경에 따라 마지막 결과까지 안정적으로 받지 못할 수 있음
+        # 따라서, UPSERT와 건수 조회를 분리하는 것을 권장
+
+        upsert_sql = """
+        WITH source_weather AS (
+            SELECT
+                w.ingestion_id,
+                w.area_code,
+                w.observed_at,
+                w.temperature_c,
+                w.feels_like_c,
+                w.humidity_pct,
+                w.precipitation_type,
+                w.precipitation_mm,
+                w.wind_speed_mps,
+                w.wind_direction_deg,
+                w.pm10,
+                w.pm25,
+                w.air_quality_index,
+                w.weather_description,
+                h.collected_at,
+                w.observed_at AT TIME ZONE 'Asia/Seoul'
+                    AS observed_at_kst
+            FROM staging.realtime_weather_snapshot AS w
+            JOIN staging.realtime_city_header AS h
+            ON h.ingestion_id = w.ingestion_id
+            WHERE w.ingestion_id = %(ingestion_id)s
+            AND h.is_success = true
+        )
+        INSERT INTO warehouse.fact_weather_snapshot (
+            location_id,
+            date_key,
+            hour_key,
+            observed_at,
+            collected_at,
+            temperature_c,
+            feels_like_c,
+            humidity_pct,
+            precipitation_type,
+            precipitation_mm,
+            wind_speed_mps,
+            wind_direction_deg,
+            pm10,
+            pm25,
+            air_quality_index,
+            weather_description,
+            source_ingestion_id
+        )
+        SELECT
+            l.location_id,
+            TO_CHAR(
+                s.observed_at_kst::DATE,
+                'YYYYMMDD'
+            )::INTEGER,
+            EXTRACT(
+                HOUR FROM s.observed_at_kst
+            )::SMALLINT,
+            s.observed_at,
+            s.collected_at,
+            s.temperature_c,
+            s.feels_like_c,
+            s.humidity_pct,
+            s.precipitation_type,
+            s.precipitation_mm,
+            s.wind_speed_mps,
+            s.wind_direction_deg,
+            s.pm10,
+            s.pm25,
+            s.air_quality_index,
+            s.weather_description,
+            s.ingestion_id
+        FROM source_weather AS s
+        JOIN warehouse.dim_location AS l
+        ON l.area_code = s.area_code
+        ON CONFLICT ON CONSTRAINT uq_fact_weather_location_observed
+        DO UPDATE
+        SET
+            date_key = EXCLUDED.date_key,
+            hour_key = EXCLUDED.hour_key,
+            collected_at = EXCLUDED.collected_at,
+            temperature_c = EXCLUDED.temperature_c,
+            feels_like_c = EXCLUDED.feels_like_c,
+            humidity_pct = EXCLUDED.humidity_pct,
+            precipitation_type = EXCLUDED.precipitation_type,
+            precipitation_mm = EXCLUDED.precipitation_mm,
+            wind_speed_mps = EXCLUDED.wind_speed_mps,
+            wind_direction_deg = EXCLUDED.wind_direction_deg,
+            pm10 = EXCLUDED.pm10,
+            pm25 = EXCLUDED.pm25,
+            air_quality_index = EXCLUDED.air_quality_index,
+            weather_description = EXCLUDED.weather_description,
+            source_ingestion_id = EXCLUDED.source_ingestion_id,
+            dw_updated_at = CURRENT_TIMESTAMP
+        WHERE EXCLUDED.collected_at >=
+            warehouse.fact_weather_snapshot.collected_at;
+        """
+
+        count_sql = """
+        SELECT COUNT(*)
+        FROM warehouse.fact_weather_snapshot
+        WHERE source_ingestion_id = %(ingestion_id)s;
+        """
+
+        hook.run(
+            upsert_sql,
+            parameters={
+                "ingestion_id": ingestion_id,
+            },
+        )
+
+        result = hook.get_first(
+            count_sql,
+            parameters={
+                "ingestion_id": ingestion_id,
+            },
+        )
+
+        fact_count = result[0]
+
+        logger.info(
+            "Weather Fact UPSERT 완료 | "
+            "ingestion_id=%s, fact_count=%s",
+            ingestion_id,
+            fact_count,
+        )
+
+        if fact_count != 1:
+            raise AirflowException(
+                "Weather Fact 적재 건수 오류: "
+                f"ingestion_id={ingestion_id}, "
+                f"expected=1, actual={fact_count}"
+            )
+
+        return ingestion_id
+
+    @task
+    def validate_weather_dw_load(ingestion_id: int) -> int:
+        """
+        현재 ingestion_id의 Weather Staging → Weather Fact 적재 결과를 검증한다.
+
+        검증 실패 시 AirflowException을 발생시켜
+        해당 DAG Run을 실패 처리한다.
+        """
+
+        logger = logging.getLogger(__name__)
+
+        hook = PostgresHook(
+            postgres_conn_id=POSTGRES_CONN_ID,
+        )
+
+        sql = """
+        WITH current_fact AS (
+            SELECT
+                f.weather_snapshot_id,
+                f.location_id,
+                f.date_key,
+                f.hour_key,
+                f.observed_at,
+                f.collected_at,
+                f.temperature_c,
+                f.humidity_pct,
+                f.precipitation_mm,
+                f.wind_speed_mps,
+                f.pm10,
+                f.pm25,
+                f.source_ingestion_id
+            FROM warehouse.fact_weather_snapshot AS f
+            WHERE f.source_ingestion_id = %(ingestion_id)s
+        )
+        SELECT
+            COUNT(*) AS fact_count,
+
+            COUNT(*) FILTER (
+                WHERE l.location_id IS NULL
+            ) AS missing_location_count,
+
+            COUNT(*) FILTER (
+                WHERE d.date_key IS NULL
+            ) AS missing_date_count,
+
+            COUNT(*) FILTER (
+                WHERE h.hour_key IS NULL
+            ) AS missing_hour_count,
+
+            COUNT(*) FILTER (
+                WHERE f.humidity_pct IS NOT NULL
+                AND f.humidity_pct NOT BETWEEN 0 AND 100
+            ) AS invalid_humidity_count,
+
+            COUNT(*) FILTER (
+                WHERE f.precipitation_mm IS NOT NULL
+                AND f.precipitation_mm < 0
+            ) AS invalid_precipitation_count,
+
+            COUNT(*) FILTER (
+                WHERE f.wind_speed_mps IS NOT NULL
+                AND f.wind_speed_mps < 0
+            ) AS invalid_wind_speed_count,
+
+            COUNT(*) FILTER (
+                WHERE f.pm10 IS NOT NULL
+                AND f.pm10 < 0
+            ) AS invalid_pm10_count,
+
+            COUNT(*) FILTER (
+                WHERE f.pm25 IS NOT NULL
+                AND f.pm25 < 0
+            ) AS invalid_pm25_count,
+
+            COUNT(*) FILTER (
+                WHERE f.observed_at > f.collected_at
+            ) AS future_observation_count,
+
+            COUNT(*) FILTER (
+                WHERE f.date_key <> TO_CHAR(
+                    (f.observed_at AT TIME ZONE 'Asia/Seoul')::DATE,
+                    'YYYYMMDD'
+                )::INTEGER
+                OR f.hour_key <> EXTRACT(
+                    HOUR FROM f.observed_at AT TIME ZONE 'Asia/Seoul'
+                )::SMALLINT
+            ) AS time_key_mismatch_count,
+
+            COUNT(*) FILTER (
+                WHERE w.ingestion_id IS NULL
+            ) AS missing_staging_weather_count,
+
+            COUNT(*) FILTER (
+                WHERE w.ingestion_id IS NOT NULL
+                AND (
+                        f.observed_at IS DISTINCT FROM w.observed_at
+                    OR f.temperature_c IS DISTINCT FROM w.temperature_c
+                    OR f.humidity_pct IS DISTINCT FROM w.humidity_pct
+                    OR f.precipitation_mm IS DISTINCT FROM w.precipitation_mm
+                    OR f.wind_speed_mps IS DISTINCT FROM w.wind_speed_mps
+                    OR f.pm10 IS DISTINCT FROM w.pm10
+                    OR f.pm25 IS DISTINCT FROM w.pm25
+                )
+            ) AS staging_fact_weather_mismatch_count
+
+        FROM current_fact AS f
+
+        LEFT JOIN warehouse.dim_location AS l
+        ON l.location_id = f.location_id
+
+        LEFT JOIN warehouse.dim_date AS d
+        ON d.date_key = f.date_key
+
+        LEFT JOIN warehouse.dim_hour AS h
+        ON h.hour_key = f.hour_key
+
+        LEFT JOIN staging.realtime_weather_snapshot AS w
+        ON w.ingestion_id = f.source_ingestion_id
+        AND w.area_code = l.area_code
+        AND w.observed_at = f.observed_at;
+        """
+
+        row = hook.get_first(
+            sql,
+            parameters={
+                "ingestion_id": ingestion_id,
+            },
+        )
+
+        (
+            fact_count,
+            missing_location_count,
+            missing_date_count,
+            missing_hour_count,
+            invalid_humidity_count,
+            invalid_precipitation_count,
+            invalid_wind_speed_count,
+            invalid_pm10_count,
+            invalid_pm25_count,
+            future_observation_count,
+            time_key_mismatch_count,
+            missing_staging_weather_count,
+            staging_fact_weather_mismatch_count,
+        ) = row
+
+        metrics = {
+            "ingestion_id": ingestion_id,
+            "fact_count": fact_count,
+            "missing_location_count": missing_location_count,
+            "missing_date_count": missing_date_count,
+            "missing_hour_count": missing_hour_count,
+            "invalid_humidity_count": invalid_humidity_count,
+            "invalid_precipitation_count": invalid_precipitation_count,
+            "invalid_wind_speed_count": invalid_wind_speed_count,
+            "invalid_pm10_count": invalid_pm10_count,
+            "invalid_pm25_count": invalid_pm25_count,
+            "future_observation_count": future_observation_count,
+            "time_key_mismatch_count": time_key_mismatch_count,
+            "missing_staging_weather_count": missing_staging_weather_count,
+            "staging_fact_weather_mismatch_count":
+                staging_fact_weather_mismatch_count,
+        }
+
+        if fact_count != 1:
+            raise AirflowException(
+                "Weather Fact 건수 오류: "
+                f"ingestion_id={ingestion_id}, "
+                f"expected=1, actual={fact_count}, "
+                f"metrics={metrics}"
+            )
+
+        failed_checks = {
+            "missing_location_count": missing_location_count,
+            "missing_date_count": missing_date_count,
+            "missing_hour_count": missing_hour_count,
+            "invalid_humidity_count": invalid_humidity_count,
+            "invalid_precipitation_count": invalid_precipitation_count,
+            "invalid_wind_speed_count": invalid_wind_speed_count,
+            "invalid_pm10_count": invalid_pm10_count,
+            "invalid_pm25_count": invalid_pm25_count,
+            "future_observation_count": future_observation_count,
+            "time_key_mismatch_count": time_key_mismatch_count,
+            "missing_staging_weather_count": missing_staging_weather_count,
+            "staging_fact_weather_mismatch_count":
+                staging_fact_weather_mismatch_count,
+        }
+
+        violations = {
+            name: count
+            for name, count in failed_checks.items()
+            if count != 0
+        }
+
+        if violations:
+            raise AirflowException(
+                "Weather DW 데이터 품질 검증 실패: "
+                f"ingestion_id={ingestion_id}, "
+                f"violations={violations}, "
+                f"metrics={metrics}"
+            )
+
+        logger.info(
+            "Weather DW 데이터 품질 검증 성공. metrics=%s",
+            metrics,
+        )
+
+        return ingestion_id
+
+    @task_group
+    def location_etl_pipeline(area_name: str) -> int:
+        raw_id = extract_real_api_to_raw(area_name)
+        validated_raw_id = validate_raw_payload(raw_id)
+        ingestion_id = load_population_to_staging(validated_raw_id)
+        dimension_ingestion_id = load_dimensions(ingestion_id)
+        weather_ingestion_id = load_weather_to_staging(ingestion_id)
+        fact_ingestion_id = load_fact_city_snapshot(dimension_ingestion_id)
+        city_validation_ingestion_id = validate_dw_load(fact_ingestion_id)
+        weather_fact_ingestion_id = load_fact_weather_snapshot(weather_ingestion_id)
+        
+        return validate_weather_dw_load(weather_fact_ingestion_id)
+         
+
+    location_etl_pipeline.override(group_id="yongsan_station")(area_name="용산역")
+    location_etl_pipeline.override(group_id="yeouido")(area_name="여의도")
+    location_etl_pipeline.override(group_id="guanghwamun")(area_name="광화문·덕수궁")
+
 
 seoul_realtime_population_pipeline()
