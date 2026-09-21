@@ -55,3 +55,31 @@ API 요청에는 장소명 `area_name`을 사용하고, 성공 응답의 `CITYDA
 각 지역은 독립적으로 Raw → Validate → Staging → Dimension → Fact → DW Validation 체인을 수행한다. Warehouse Fact는 `UNIQUE (location_id, observed_at)` 제약과 UPSERT를 사용하므로, 동일 지역·동일 관측 시각의 재처리에서도 중복 행이 생성되지 않는다.
 
 최신 검증에서 세 지역은 모두 동일한 관측 시각인 2026-09-16 14:55 KST에 대해 Fact 1건씩 적재되었으며, 업무 키 중복은 발생하지 않았다.
+
+### 예약 실행 정책
+
+- 검증 스케줄: `*/15 * * * *` (UTC 기준, 1시간 동안 자동 실행 확인)
+- 운영 스케줄: `0 0,6,12,18 * * *` (UTC 기준)
+- 운영 시간: 09:00, 15:00, 21:00, 03:00 KST
+- `catchup=False`: 과거 실행 구간의 실시간 API 수집을 방지
+- `max_active_runs=1`: 이전 실행이 끝나기 전 다음 실행이 겹치지 않도록 제한
+
+### Airflow 예약 실행 검증
+
+실제 서울시 실시간 인구 파이프라인에 검증용 cron
+`*/15 * * * *`를 적용하고, 약 1시간 동안 예약 실행을 관찰했다.
+
+- DAG: `seoul_realtime_population_pipeline`
+- 검증 스케줄: 15분 간격
+- 확인된 Scheduled DagRun: 4회
+- 각 DagRun 상태: `success`
+- Run Type: 모두 `scheduled`
+- 결론: 수동 Trigger 없이 Airflow Scheduler가 설정된 cron에 따라
+  DAG를 주기적으로 생성하고 실행함을 확인했다.
+
+검증 완료 후 운영 스케줄을
+`0 0,6,12,18 * * *`로 변경한다.
+
+- UTC: 00:00, 06:00, 12:00, 18:00
+- KST: 09:00, 15:00, 21:00, 다음 날 03:00
+- `catchup=False`로 과거 실시간 수집 구간의 자동 재실행을 방지한다.

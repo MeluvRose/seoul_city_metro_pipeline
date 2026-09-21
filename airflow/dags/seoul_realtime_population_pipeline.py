@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from decimal import Decimal, InvalidOperation
 
@@ -39,13 +39,24 @@ def to_decimal_or_none(value: object) -> Decimal | None:
     except (InvalidOperation, ValueError) as exc:
         raise ValueError(f"숫자 변환 불가: value={value!r}") from exc
 
+DEFAULT_ARGS = {
+    "owner": "jinsu",
+    "depends_on_past": False,
+    "retries": 2,
+    "retry_delay": timedelta(minutes=3),
+    "retry_exponential_backoff": True,
+    "max_retry_delay": timedelta(minutes=15),
+}
 
 @dag(
     dag_id="seoul_realtime_population_pipeline",
     description="서울시 실시간 도시데이터 XML을 JSONB Raw 계층에 수집하는 DAG",
-    start_date=datetime(2026, 9, 1),
-    schedule=None,
+    start_date=datetime(2026, 9, 21),
+    schedule="30 1,3,5,7,9,11,13,21,23 * * *",
+    # schedule="*/15 * * * *",
     catchup=False,
+    default_args=DEFAULT_ARGS,
+    max_active_runs=1,
     tags=["seoul", "realtime", "xml", "population"],
 )
 def seoul_realtime_population_pipeline():
@@ -322,6 +333,13 @@ def seoul_realtime_population_pipeline():
         )
 
         return saved_raw_id
+
+    # 재시도 검증용 태스크 (임시)
+    # @task
+    # def retry_probe() -> str:
+    #     raise AirflowException(
+    #         "Intentional retry test: verify task retry configuration"
+    #     )
 
     @task
     def load_population_to_staging(raw_id: int) -> int:
@@ -1380,6 +1398,10 @@ def seoul_realtime_population_pipeline():
     def location_etl_pipeline(area_name: str) -> int:
         raw_id = extract_real_api_to_raw(area_name)
         validated_raw_id = validate_raw_payload(raw_id)
+        
+        # validated_raw_id = 741
+        # retry_probe()
+        
         ingestion_id = load_population_to_staging(validated_raw_id)
         dimension_ingestion_id = load_dimensions(ingestion_id)
         weather_ingestion_id = load_weather_to_staging(ingestion_id)
