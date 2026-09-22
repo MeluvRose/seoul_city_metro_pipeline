@@ -9,6 +9,7 @@ from decimal import Decimal, InvalidOperation
 import requests
 import xmltodict
 import logging
+import hashlib
 
 from airflow.decorators import dag, task, task_group
 from airflow.exceptions import AirflowFailException, AirflowException
@@ -18,7 +19,6 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 POSTGRES_CONN_ID = "seoul_city_postgres"
 SOURCE_NAME = "seoul_realtime_city"
-TARGET_AREA_NAMES = ["용산역", "여의도", "광화문·덕수궁"]
 KST = ZoneInfo("Asia/Seoul")
 
 def to_decimal_or_none(value: object) -> Decimal | None:
@@ -61,6 +61,85 @@ DEFAULT_ARGS = {
 )
 def seoul_realtime_population_pipeline():
     @task
+    def get_active_location_requests() -> list[dict]:
+        sql = """
+            SELECT
+                source_area_name AS request_area_name,
+                analysis_area_code,
+                analysis_area_name,
+                area_type,
+                district_name
+            FROM staging.location_source_map
+            WHERE source_name = 'seoul_realtime_city'
+            AND is_active = TRUE
+            AND valid_from <= CURRENT_DATE
+            AND (valid_to IS NULL OR valid_to >= CURRENT_DATE)
+            ORDER BY analysis_area_code;
+        """
+
+        hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+        rows = hook.get_records(sql)
+
+        if not rows:
+            raise AirflowException(
+                "No active Seoul realtime city locations are configured."
+            )
+
+        locations = [
+            {
+                "request_area_name": request_area_name,
+                "analysis_area_code": analysis_area_code,
+                "analysis_area_name": analysis_area_name,
+                "area_type": area_type,
+                "district_name": district_name,
+            }
+            for (
+                request_area_name,
+                analysis_area_code,
+                analysis_area_name,
+                area_type,
+                district_name,
+            ) in rows
+        ]
+
+        if len(locations) != 8:
+            raise AirflowException(
+                f"Expected 8 active locations, got {len(locations)}."
+            )
+
+        return locations
+
+    @task
+    def extract_request_area_names(
+        locations: list[dict],
+    ) -> list[str]:
+        area_names = [
+            location["request_area_name"]
+            for location in locations
+        ]
+
+        if not area_names:
+            raise AirflowFailException(
+                "No request area names were returned."
+            )
+
+        return area_names
+
+    @task
+    def validate_active_location_count(
+        locations: list[dict],
+    ) -> list[dict]:
+        expected_count = 8
+
+        if len(locations) != expected_count:
+            raise AirflowException(
+                f"Expected {expected_count} active locations, "
+                f"got {len(locations)}."
+            )
+
+        return locations
+
+    @task
     def extract_real_api_to_raw(target_area: str) -> int:
         api_key = Variable.get("SEOUL_OPEN_API_KEY")
 
@@ -75,6 +154,12 @@ def seoul_realtime_population_pipeline():
             http_status = response.status_code
             payload_xml = response.text
             payload_dict = xmltodict.parse(payload_xml)
+            canonical_payload = json.dumps(
+                payload_dict,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
 
         except requests.RequestException as exc:
             raise AirflowFailException(
@@ -88,6 +173,8 @@ def seoul_realtime_population_pipeline():
         
         # 성공 응답: <SeoulRtd.citydata><CITYDATA>...</CITYDATA>
         city_response = payload_dict.get("SeoulRtd.citydata")
+
+        print(city_response)
 
         # 오류 응답: <RESULT><CODE>...</CODE><MESSAGE>...</MESSAGE></RESULT>
         if city_response is None:
@@ -126,9 +213,12 @@ def seoul_realtime_population_pipeline():
                 area_name,
                 requested_at,
                 http_status,
+                result_code,
+                result_message,
                 is_success,
                 payload_xml,
-                payload
+                payload,
+                payload_hash
             )
             VALUES (
                 %(source_name)s,
@@ -136,9 +226,12 @@ def seoul_realtime_population_pipeline():
                 %(area_name)s,
                 %(requested_at)s,
                 %(http_status)s,
+                %(result_code)s,
+                %(result_message)s,
                 %(is_success)s,
                 %(payload_xml)s,
-                %(payload)s::jsonb
+                %(payload)s::jsonb,
+                %(payload_hash)s
             )
             RETURNING raw_id;
             """,
@@ -148,12 +241,17 @@ def seoul_realtime_population_pipeline():
                 "area_name": area_name,
                 "requested_at": requested_at,
                 "http_status": http_status,
+                "result_code": result_code,
+                "result_message": result_message,
                 "is_success": is_success,
                 "payload_xml": payload_xml,
                 "payload": json.dumps(
                     payload_dict,
                     ensure_ascii=False,
                 ),
+                "payload_hash": hashlib.sha256(
+                    canonical_payload.encode("utf-8")
+                ).hexdigest(),
             },
         )
 
@@ -1395,8 +1493,8 @@ def seoul_realtime_population_pipeline():
         return ingestion_id
 
     @task_group
-    def location_etl_pipeline(area_name: str) -> int:
-        raw_id = extract_real_api_to_raw(area_name)
+    def location_etl_pipeline(request_area_name: str) -> int:
+        raw_id = extract_real_api_to_raw(request_area_name)
         validated_raw_id = validate_raw_payload(raw_id)
         
         # validated_raw_id = 741
@@ -1411,10 +1509,12 @@ def seoul_realtime_population_pipeline():
         
         return validate_weather_dw_load(weather_fact_ingestion_id)
          
+    active_locations = get_active_location_requests()
+    validated_locations = validate_active_location_count(active_locations)
+    request_area_names = extract_request_area_names(validated_locations)
 
-    location_etl_pipeline.override(group_id="yongsan_station")(area_name="용산역")
-    location_etl_pipeline.override(group_id="yeouido")(area_name="여의도")
-    location_etl_pipeline.override(group_id="guanghwamun")(area_name="광화문·덕수궁")
-
+    # if, 리스트 길이가 (8)이면 location_etl_pipeline을 (8)개 생성해라.
+    # 각 그룹에는 리스트의 딕셔너리 한 개씩 전달해라.
+    location_etl_pipeline.expand(request_area_name=request_area_names)
 
 seoul_realtime_population_pipeline()
